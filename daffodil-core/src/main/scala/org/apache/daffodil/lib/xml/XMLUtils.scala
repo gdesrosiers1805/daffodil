@@ -26,6 +26,8 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardOpenOption
 import javax.xml.XMLConstants
+import javax.xml.datatype.DatatypeConstants
+import javax.xml.datatype.DatatypeFactory
 import scala.annotation.tailrec
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuilder
@@ -33,9 +35,6 @@ import scala.math.abs
 import scala.util.matching.Regex
 import scala.xml.*
 
-import org.apache.daffodil.lib.calendar.DFDLDateConversion
-import org.apache.daffodil.lib.calendar.DFDLDateTimeConversion
-import org.apache.daffodil.lib.calendar.DFDLTimeConversion
 import org.apache.daffodil.lib.exceptions.*
 import org.apache.daffodil.lib.iapi.DaffodilSchemaSource
 import org.apache.daffodil.lib.iapi.URISchemaSource
@@ -53,6 +52,9 @@ import org.xml.sax.XMLReader
  */
 
 object XMLUtils {
+
+  // DatatypeFactory creation is relatively expensive, so create it once and reuse.
+  private val datatypeFactory = DatatypeFactory.newInstance()
 
   lazy val schemaForDFDLSchemas =
     Misc.getRequiredResource("org/apache/daffodil/xsd/XMLSchema_for_DFDL.xsd")
@@ -1301,6 +1303,44 @@ Differences were (path, expected, actual):
   }
 
   /**
+   * Compares two XSD date/time lexical strings (`xs:date`, `xs:time`, or
+   * `xs:dateTime`) for value equality.
+   *
+   * Parsing both values into `XMLGregorianCalendar` and comparing via the XSD
+   * `·order·` relation gives several properties we want for free, without ICU:
+   *
+   *   - Trailing sub-second zeros are ignored: `12:00:00.234` and
+   *     `12:00:00.234000` compare equal, since fractional seconds are carried as
+   *     `BigDecimal` and compared by value (`BigDecimal.compareTo`, which is
+   *     scale-independent).
+   *   - Two values that both carry a timezone are normalized to UTC before
+   *     comparison, so values denoting the same instant in different offsets
+   *     compare EQUAL. For example, `12:00:00-05:00` and `13:00:00-04:00` both
+   *     normalize to `17:00:00Z`, so they are EQUAL. Note this means the offset
+   *     itself is NOT treated as significant when both sides have one — only the
+   *     instant is compared.
+   *   - When one value has a timezone and the other does not, the comparison
+   *     follows XSD rule and yields `INDETERMINATE`.
+   *
+   * Usng `XMLGregorianCalendar` keeps ICU off this comparison path entirely,
+   * which is what allows the IBM DFDL cross tester (pinned to an older ICU
+   * version) to share this code without hitting newer-ICU-only methods
+   * (DAFFODIL-3077).
+   *
+   * @param dataA the first value's lexical string
+   * @param dataB the second value's lexical string
+   * @return true if the two values are equal under the XSD order relation.
+   * @throws IllegalArgumentException if either string is not a valid lexical
+   *         representation of an XSD date/time.
+   * @throws NullPointerException if either string is null
+   */
+  private def dateTimeIsSame(dataA: String, dataB: String): Boolean = {
+    val a = datatypeFactory.newXMLGregorianCalendar(dataA)
+    val b = datatypeFactory.newXMLGregorianCalendar(dataB)
+    a.compare(b) == DatatypeConstants.EQUAL
+  }
+
+  /**
    * Compares two strings of xml text, optionally using type information to tolerate insignificant differences, and
    * optionally using a tolerance amount for floating point comparison.
    *
@@ -1326,20 +1366,9 @@ Differences were (path, expected, actual):
 
     maybeType match {
       case Some("xs:hexBinary") => dataA.equalsIgnoreCase(dataB)
-      case Some("xs:date") => {
-        val a = DFDLDateConversion.fromXMLString(dataA)
-        val b = DFDLDateConversion.fromXMLString(dataB)
-        a == b
-      }
-      case Some("xs:time") => {
-        val a = DFDLTimeConversion.fromXMLString(dataA)
-        val b = DFDLTimeConversion.fromXMLString(dataB)
-        a == b
-      }
-      case Some("xs:dateTime") => {
-        val a = DFDLDateTimeConversion.fromXMLString(dataA)
-        val b = DFDLDateTimeConversion.fromXMLString(dataB)
-        a == b
+      case Some("xs:date") | Some("xs:time") | Some("xs:dateTime") => {
+        // braces are redundant in case clauses, but kept here for consistency.
+        dateTimeIsSame(dataA, dataB)
       }
       case Some("xs:double") => {
         val a = strToDouble(dataA)
